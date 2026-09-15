@@ -8217,28 +8217,73 @@ impl<F: BufFactory> Connection<F> {
             };
 
             if !self.handshake_confirmed {
-                match epoch {
-                    // When a first-flight error happens after packet
-                    // authentication, prefer an Initial close that the peer
-                    // can decrypt.
-                    packet::Epoch::Application
-                        if self.recv_count == 0 &&
-                            self.received_authenticated_packet &&
-                            self.crypto_ctx[packet::Epoch::Initial].has_keys() =>
-                        return Ok(Type::Initial),
+                // Prefer an Initial close whenever one can still be written.
+                //
+                // RFC 9000 10.2.3: a peer cannot read a CONNECTION_CLOSE sent in a
+                // Handshake packet until it holds handshake keys, and until the
+                // handshake is CONFIRMED we cannot know that it does. A close the
+                // peer cannot decrypt is a close it never saw.
+                //
+                // This used to require `recv_count == 0`, which only covered a
+                // first-flight error -- the case upstream PR #2521 was written for.
+                // It misses the one that matters here. When a server rejects a
+                // client's 0-RTT after processing the ClientHello, `recv_count` is
+                // already non-zero and the TLS write level is already OneRTT, so the
+                // old code fell through to `Type::Handshake`. The client had sent
+                // only its ClientHello and a 0-RTT packet, so it had Initial and
+                // 0-RTT keys and NO handshake keys, and the close was undecryptable.
+                //
+                // Measured: h3spec's "MUST send PROTOCOL_VIOLATION if CRYPTO in
+                // 0-RTT is received [TLS 8.3]" failed with the client's qlog showing
+                // it received only an Initial carrying an ACK -- no CONNECTION_CLOSE
+                // and no server CRYPTO at all.
+                //
+                // The discriminator is whether WE have ever sent a Handshake
+                // packet. A client derives its handshake keys from the server's
+                // handshake flight, so a server that has sent none knows the client
+                // cannot have them. Once the flight has gone out the client may well
+                // be established and will have DISCARDED its Initial keys, at which
+                // point an Initial close is the unreadable one -- which is what
+                // quiche's own `app_close_by_server_during_handshake_not_established`
+                // pins, and what a blanket "always prefer Initial" broke.
+                //
+                // Restricted to the server: a client's handshake keys come from its
+                // peer's sends, not its own, so the same inference does not hold in
+                // that direction. Clients keep the previous behaviour.
+                let peer_cannot_have_handshake_keys = self.is_server &&
+                    self.pkt_num_spaces[packet::Epoch::Handshake]
+                        .largest_tx_pkt_num
+                        .is_none();
 
-                    // Downgrade the epoch to Handshake as the handshake is not
-                    // completed yet.
-                    packet::Epoch::Application => return Ok(Type::Handshake),
+                if peer_cannot_have_handshake_keys &&
+                    self.crypto_ctx[packet::Epoch::Initial].has_keys()
+                {
+                    return Ok(Type::Initial);
+                }
 
-                    // Downgrade the epoch to Initial as the remote peer might
-                    // not be able to decrypt handshake packets yet.
-                    packet::Epoch::Handshake
-                        if self.crypto_ctx[packet::Epoch::Initial].has_keys() =>
-                        return Ok(Type::Initial),
+                // The original first-flight case, kept: an error after packet
+                // authentication but before anything was received.
+                if epoch == packet::Epoch::Application &&
+                    self.recv_count == 0 &&
+                    self.received_authenticated_packet &&
+                    self.crypto_ctx[packet::Epoch::Initial].has_keys()
+                {
+                    return Ok(Type::Initial);
+                }
 
-                    _ => (),
-                };
+                // Downgrade Handshake to Initial where the peer might not have
+                // handshake keys yet, as before.
+                if epoch == packet::Epoch::Handshake &&
+                    self.crypto_ctx[packet::Epoch::Initial].has_keys()
+                {
+                    return Ok(Type::Initial);
+                }
+
+                // No Initial keys left. Application data cannot be sent before the
+                // handshake completes, so downgrade to Handshake.
+                if epoch == packet::Epoch::Application {
+                    return Ok(Type::Handshake);
+                }
             }
 
             return Ok(Type::from_epoch(epoch));
