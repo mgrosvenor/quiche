@@ -824,6 +824,42 @@ impl Config {
         self.tls_ctx.set_early_data_enabled(true);
     }
 
+    /// Enables certificate compression, RFC 8879.
+    ///
+    /// Registers every algorithm this build supports as a COMPRESSOR: zlib and
+    /// brotli always, zstd when the `cert-compression-zstd` feature is on. A server
+    /// needs only compressors; decompression is the client's side of the exchange.
+    ///
+    /// BoringSSL negotiates from the intersection with the client's
+    /// `compress_certificate` extension, so a client that advertises nothing simply
+    /// receives the certificate uncompressed. There is no compatibility cost.
+    ///
+    /// ## Why a server wants this
+    ///
+    /// QUIC forbids a server from sending more than `factor x bytes received`
+    /// before it has validated the client's address (RFC 9000 8.1). A client's
+    /// opening Initial is padded to 1200 bytes, so at the conforming factor of 3 the
+    /// budget is 3600 bytes. A modern certificate chain does not fit: measured on a
+    /// Let's Encrypt ECDSA chain of 3429 bytes, the whole handshake flight came to
+    /// 4082, which is 482 over. The server sent 3600, stopped, and waited a full
+    /// round trip for an ACK before finishing -- about 2 RTT for a handshake that
+    /// should take 1.
+    ///
+    /// On that same chain:
+    ///
+    /// ```text
+    /// uncompressed  3429 bytes
+    /// zlib          2359 bytes  69%
+    /// brotli        2258 bytes  66%
+    /// zstd          2308 bytes  67%
+    /// ```
+    ///
+    /// Any of them clears the 482 bytes needed, which is what lets a server keep the
+    /// conforming amplification factor instead of raising it.
+    pub fn enable_cert_compression(&mut self) -> Result<()> {
+        self.tls_ctx.enable_cert_compression()
+    }
+
     /// Configures the list of supported application protocols.
     ///
     /// On the client this configures the list of protocols to send to the

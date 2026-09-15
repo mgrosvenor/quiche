@@ -70,6 +70,23 @@ struct SSL {
     _unused: c_void,
 }
 
+// BoringSSL's byte builder, the output sink a certificate compressor writes into.
+// Only ever referenced behind a pointer, which does not count as construction.
+#[allow(non_camel_case_types, dead_code)]
+#[repr(transparent)]
+struct CBB {
+    _unused: c_void,
+}
+
+// Reference-counted buffer BoringSSL hands back from a DEcompressor. Declared so
+// the callback signatures match the header exactly even though a server registers
+// no decompressor: RFC 8879 decompression is the client's side of the exchange.
+#[allow(non_camel_case_types, dead_code)]
+#[repr(transparent)]
+struct CRYPTO_BUFFER {
+    _unused: c_void,
+}
+
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
 struct SSL_CIPHER {
@@ -195,6 +212,46 @@ impl Context {
                 path.as_ptr(),
             )
         })
+    }
+
+    /// Register every RFC 8879 certificate compression algorithm available.
+    ///
+    /// Server side only: compressors, no decompressors. BoringSSL negotiates from
+    /// the intersection with the client's `compress_certificate` extension, so a
+    /// client advertising none simply receives the certificate uncompressed and
+    /// nothing is lost.
+    ///
+    /// Registration failures are returned rather than swallowed. A silently
+    /// unregistered algorithm looks exactly like a client that did not ask for it,
+    /// and the whole purpose here is a size difference somebody will later try to
+    /// verify.
+    pub fn enable_cert_compression(&mut self) -> Result<()> {
+        // 1 = zlib, 2 = brotli, 3 = zstd. RFC 8879 section 3.
+        unsafe {
+            map_result(SSL_CTX_add_cert_compression_alg(
+                self.as_mut_ptr(),
+                1,
+                Some(cert_compress_zlib),
+                None,
+            ))?;
+
+            map_result(SSL_CTX_add_cert_compression_alg(
+                self.as_mut_ptr(),
+                2,
+                Some(cert_compress_brotli),
+                None,
+            ))?;
+
+            #[cfg(feature = "cert-compression-zstd")]
+            map_result(SSL_CTX_add_cert_compression_alg(
+                self.as_mut_ptr(),
+                3,
+                Some(cert_compress_zstd),
+                None,
+            ))?;
+        }
+
+        Ok(())
     }
 
     pub fn use_certificate_chain_file(&mut self, file: &str) -> Result<()> {
@@ -755,6 +812,97 @@ fn get_cipher_from_ptr(cipher: *const SSL_CIPHER) -> Result<crypto::Algorithm> {
     Ok(alg)
 }
 
+// ── Certificate compression, RFC 8879 ────────────────────────────────────────
+//
+// A server registers COMPRESSORS only. Decompression is the client's side of the
+// exchange: it receives a compressed certificate and expands it. Passing `None`
+// for the decompressor is how the header expects that to be expressed.
+//
+// Why this exists at all, measured rather than assumed. QUIC forbids a server from
+// sending more than `factor x bytes received` before it has validated the client's
+// address (RFC 9000 8.1). A client's opening Initial is padded to 1200 bytes, so at
+// the conforming factor of 3 the budget is 3600. An uncompressed Let's Encrypt
+// ECDSA chain is 3429 bytes and the whole handshake flight is 4082, which is 482
+// over -- so the server sends 3600, stops, and waits a full round trip for an ACK.
+// Measured on a 4.85ms path, that made the handshake ~2 RTT instead of 1.
+//
+// On the same chain:
+//
+//     uncompressed  3429 bytes
+//     zlib          2359 bytes  69%   saves 1070
+//     brotli        2258 bytes  66%   saves 1171
+//     zstd          2308 bytes  67%   saves 1121
+//
+// Any of the three clears the 482 needed, which is what lets the amplification
+// factor go back to the conforming 3.
+//
+// All three are registered. BoringSSL negotiates from the intersection with the
+// client's `compress_certificate` extension, so a browser advertising brotli gets
+// brotli and one advertising only zlib still gets compression. Registering one
+// would have made the win depend on the client population.
+
+/// Hand a compressed certificate back to BoringSSL.
+///
+/// Shared by all three algorithms because the only per-algorithm part is producing
+/// the bytes. Returns 1 on success and 0 on failure, per the header: a zero makes
+/// BoringSSL fall back to sending the certificate uncompressed, which is a
+/// performance loss and never a correctness one.
+fn emit_compressed(out: *mut CBB, data: &[u8]) -> c_int {
+    // SAFETY: `out` is the CBB BoringSSL passed us, valid for this call, and
+    // `data` is a live slice we own for the duration.
+    unsafe { CBB_add_bytes(out, data.as_ptr(), data.len()) }
+}
+
+/// RFC 8879 algorithm 1, zlib.
+extern "C" fn cert_compress_zlib(
+    _ssl: *mut SSL, out: *mut CBB, in_: *const u8, in_len: usize,
+) -> c_int {
+    // SAFETY: BoringSSL guarantees `in_` is valid for `in_len` bytes.
+    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    // Level 9: this runs once per full handshake, not per request, and a
+    // certificate is a few kilobytes. The bytes matter and the microseconds do not.
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(input, 9);
+    emit_compressed(out, &compressed)
+}
+
+/// RFC 8879 algorithm 2, brotli. The best ratio of the three on our own chain.
+extern "C" fn cert_compress_brotli(
+    _ssl: *mut SSL, out: *mut CBB, in_: *const u8, in_len: usize,
+) -> c_int {
+    // SAFETY: as above.
+    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    let mut compressed = Vec::new();
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: 11,
+        ..Default::default()
+    };
+    let mut reader = input;
+    if brotli::BrotliCompress(&mut reader, &mut compressed, &params).is_err() {
+        // Zero means "could not compress"; BoringSSL sends the chain plain.
+        return 0;
+    }
+    emit_compressed(out, &compressed)
+}
+
+/// RFC 8879 algorithm 3, zstd.
+///
+/// Behind a feature because it is the only one of the three with no pure-Rust
+/// compressor: the `zstd` crate builds C libzstd. quiche already links BoringSSL so
+/// C is not a new class of dependency, but this is a second C build in the QUIC
+/// path for 50 bytes less than brotli on a real chain, which is a trade worth being
+/// deliberate about rather than inheriting.
+#[cfg(feature = "cert-compression-zstd")]
+extern "C" fn cert_compress_zstd(
+    _ssl: *mut SSL, out: *mut CBB, in_: *const u8, in_len: usize,
+) -> c_int {
+    // SAFETY: as above.
+    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    match zstd::bulk::compress(input, 19) {
+        Ok(compressed) => emit_compressed(out, &compressed),
+        Err(_) => 0,
+    }
+}
+
 extern "C" fn set_read_secret(
     ssl: *mut SSL, level: crypto::Level, cipher: *const SSL_CIPHER,
     secret: *const u8, secret_len: usize,
@@ -1090,6 +1238,29 @@ extern "C" {
 
     // SSL_CTX
     fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
+
+    // Certificate compression, RFC 8879.
+    //
+    // Declared here rather than obtained from boring-sys, which builds the
+    // BoringSSL this links but generates no binding for these. The functions are
+    // present in the vendored headers; only the Rust side was missing.
+    fn SSL_CTX_add_cert_compression_alg(
+        ctx: *mut SSL_CTX, alg_id: u16,
+        compress: Option<
+            extern "C" fn(
+                ssl: *mut SSL, out: *mut CBB, in_: *const u8, in_len: usize,
+            ) -> c_int,
+        >,
+        decompress: Option<
+            extern "C" fn(
+                ssl: *mut SSL, out: *mut *mut CRYPTO_BUFFER,
+                uncompressed_len: usize, in_: *const u8, in_len: usize,
+            ) -> c_int,
+        >,
+    ) -> c_int;
+
+    // The one CBB call a compressor needs: append the compressed bytes.
+    fn CBB_add_bytes(cbb: *mut CBB, data: *const u8, len: usize) -> c_int;
     fn SSL_CTX_free(ctx: *mut SSL_CTX);
 
     fn SSL_CTX_use_certificate_chain_file(

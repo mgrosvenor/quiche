@@ -25,6 +25,8 @@ rust-version = "1.88"
 workspace = true
 
 [features]
+# RFC 8879 algorithm 3. Off by default: it builds C libzstd.
+cert-compression-zstd = ["zstd"]
 default = ["boringssl-boring-crate"]
 
 # Use the BoringSSL library provided by the boring crate.
@@ -68,6 +70,15 @@ cdylib-link-lines = { version = "0.1", optional = true }
 
 [dependencies]
 bytes = { workspace = true }
+# Certificate compression, RFC 8879. Both pure Rust: no new C in the QUIC path.
+miniz_oxide = "0.8"
+brotli = { version = "7", default-features = false, features = ["std"] }
+
+# zstd is the only one of the three with no pure-Rust compressor, so it builds C
+# libzstd and is therefore opt-in. On a real certificate chain it saves 50 bytes
+# fewer than brotli, so the default build loses nothing by leaving it off.
+zstd = { version = "0.13", optional = true }
+
 boring = { workspace = true, optional = true }
 debug_panic = { workspace = true }
 either = { version = "1.8", default-features = false }
