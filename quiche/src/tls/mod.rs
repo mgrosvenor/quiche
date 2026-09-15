@@ -236,10 +236,34 @@ impl Context {
     pub fn enable_cert_compression(&mut self) -> Result<()> {
         // 1 = zlib, 2 = brotli, 3 = zstd. RFC 8879 section 3.
         unsafe {
+            // zlib is registered for DECOMPRESSION ONLY: `None` for the
+            // compressor. As a client we advertise zlib and accept a chain
+            // compressed with it; as a server we never choose it.
+            //
+            // Not a codec problem. Our zlib output is ordinary RFC 1950, and
+            // libz decompresses it byte-identically. The problem is a peer that
+            // rebuilds the handshake transcript by RE-COMPRESSING. hs-tls, which
+            // h3spec is built on, decodes a CompressedCertificate into a
+            // certificate chain and reconstructs the wire bytes with
+            // `compress $ BL.fromStrict bs` at zlib's default level
+            // (tls/Network/TLS/Packet13.hs). A TLS 1.3 transcript is the
+            // messages AS TRANSMITTED, so that only agrees when both ends run a
+            // byte-identical compressor. We compress at level 9 with
+            // miniz_oxide, so the transcript hashes differ and the peer rejects
+            // CertificateVerify: 38 of 49 h3spec tests failed with "cannot
+            // verify CertificateVerify", and every one of them passes with the
+            // chain sent plain.
+            //
+            // zlib is also the only algorithm hs-tls implements, so offering it
+            // is what selects it for exactly the clients that cannot handle it.
+            // Offering brotli instead costs those clients nothing: they advertise
+            // no algorithm we compress with, so they get an uncompressed chain
+            // and a working handshake, and brotli compresses our own chain
+            // better than zlib did.
             map_result(SSL_CTX_add_cert_compression_alg(
                 self.as_mut_ptr(),
                 1,
-                Some(cert_compress_zlib),
+                None,
                 Some(cert_decompress_zlib),
             ))?;
 
@@ -859,18 +883,6 @@ fn emit_compressed(out: *mut CBB, data: &[u8]) -> c_int {
     // SAFETY: `out` is the CBB BoringSSL passed us, valid for this call, and
     // `data` is a live slice we own for the duration.
     unsafe { CBB_add_bytes(out, data.as_ptr(), data.len()) }
-}
-
-/// RFC 8879 algorithm 1, zlib.
-extern "C" fn cert_compress_zlib(
-    _ssl: *mut SSL, out: *mut CBB, in_: *const u8, in_len: usize,
-) -> c_int {
-    // SAFETY: BoringSSL guarantees `in_` is valid for `in_len` bytes.
-    let input = unsafe { slice::from_raw_parts(in_, in_len) };
-    // Level 9: this runs once per full handshake, not per request, and a
-    // certificate is a few kilobytes. The bytes matter and the microseconds do not.
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(input, 9);
-    emit_compressed(out, &compressed)
 }
 
 /// RFC 8879 algorithm 2, brotli. The best ratio of the three on our own chain.
