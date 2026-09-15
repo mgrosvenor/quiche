@@ -3221,6 +3221,42 @@ impl<F: BufFactory> Connection<F> {
             Some(v) => v,
 
             None => {
+                // A server that has already processed the ClientHello and still has
+                // no 0-RTT key is looking at 0-RTT the client was never entitled to
+                // send. Close, rather than buffer a packet that can never be read.
+                //
+                // Handshake keys are the discriminator, and they are the right one.
+                // A genuine resumption carries the PSK in the ClientHello, so the
+                // 0-RTT key is derived from the same message that produces the
+                // handshake keys -- if handshake keys exist and a 0-RTT key does
+                // not, no PSK was accepted and there will never be one. A 0-RTT
+                // packet arriving BEFORE the ClientHello is processed is ordinary
+                // reordering, has no handshake keys yet, and is still buffered
+                // below.
+                //
+                // This is what RFC 9001 8.3 needs in practice. That rule is about a
+                // CRYPTO frame inside a 0-RTT packet, which cannot be seen without
+                // decrypting -- and h3spec's test for it sends the 0-RTT packet
+                // during a FRESH handshake, with no resumption, so the frame is
+                // never readable by anyone. Verified from its own qlog:
+                //
+                //     1. initial: [crypto, padding]
+                //     2. initial: [crypto]
+                //     3. 0RTT:    [crypto, padding]   <- the violation
+                //     4. initial: [ack, crypto, padding]
+                //
+                // A check on frame contents therefore cannot fire, which is why the
+                // first attempt at this, a guard in `process_frame`, changed the
+                // score not at all. The enforceable fact is the packet type.
+                let server_has_handshake_keys = self.is_server &&
+                    self.crypto_ctx[packet::Epoch::Handshake]
+                        .crypto_open
+                        .is_some();
+
+                if hdr.ty == Type::ZeroRTT && server_has_handshake_keys {
+                    return Err(Error::InvalidPacket);
+                }
+
                 if hdr.ty == Type::ZeroRTT &&
                     self.undecryptable_pkts.len() < MAX_UNDECRYPTABLE_PACKETS &&
                     !self.is_established()
