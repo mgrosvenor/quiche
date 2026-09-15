@@ -81,6 +81,14 @@ struct CBB {
 // Reference-counted buffer BoringSSL hands back from a DEcompressor. Declared so
 // the callback signatures match the header exactly even though a server registers
 // no decompressor: RFC 8879 decompression is the client's side of the exchange.
+// The pool a CRYPTO_BUFFER may be interned in. We always pass null: a certificate
+// arrives once per handshake and interning buys nothing.
+#[allow(non_camel_case_types, dead_code)]
+#[repr(transparent)]
+struct CRYPTO_BUFFER_POOL {
+    _unused: c_void,
+}
+
 #[allow(non_camel_case_types, dead_code)]
 #[repr(transparent)]
 struct CRYPTO_BUFFER {
@@ -232,14 +240,14 @@ impl Context {
                 self.as_mut_ptr(),
                 1,
                 Some(cert_compress_zlib),
-                None,
+                Some(cert_decompress_zlib),
             ))?;
 
             map_result(SSL_CTX_add_cert_compression_alg(
                 self.as_mut_ptr(),
                 2,
                 Some(cert_compress_brotli),
-                None,
+                Some(cert_decompress_brotli),
             ))?;
 
             #[cfg(feature = "cert-compression-zstd")]
@@ -247,7 +255,7 @@ impl Context {
                 self.as_mut_ptr(),
                 3,
                 Some(cert_compress_zstd),
-                None,
+                Some(cert_decompress_zstd),
             ))?;
         }
 
@@ -903,6 +911,87 @@ extern "C" fn cert_compress_zstd(
     }
 }
 
+/// Hand a decompressed certificate back to BoringSSL.
+///
+/// Shared by all three algorithms. Two checks before the buffer is handed over, and
+/// both matter:
+///
+/// The length must be EXACTLY `uncompressed_len`. The header requires it, and it is
+/// what stops a compressed certificate from expanding into something far larger than
+/// the peer declared -- the decompression-bomb shape. A mismatch returns zero, which
+/// fails the handshake rather than trusting the payload.
+///
+/// `CRYPTO_BUFFER_new` copies, and setting `*out` transfers ownership to BoringSSL,
+/// which frees it. So the Vec is dropped normally on return and there is nothing to
+/// leak.
+fn emit_decompressed(
+    out: *mut *mut CRYPTO_BUFFER, uncompressed_len: usize, data: &[u8],
+) -> c_int {
+    if data.len() != uncompressed_len {
+        return 0;
+    }
+
+    // SAFETY: `data` is a live slice and the pool is deliberately null.
+    let buf = unsafe {
+        CRYPTO_BUFFER_new(data.as_ptr(), data.len(), ptr::null_mut())
+    };
+    if buf.is_null() {
+        return 0;
+    }
+
+    // SAFETY: `out` is the out-pointer BoringSSL gave us, valid for this call.
+    unsafe { *out = buf };
+    1
+}
+
+/// RFC 8879 algorithm 1, zlib, decompression.
+extern "C" fn cert_decompress_zlib(
+    _ssl: *mut SSL, out: *mut *mut CRYPTO_BUFFER, uncompressed_len: usize,
+    in_: *const u8, in_len: usize,
+) -> c_int {
+    // SAFETY: BoringSSL guarantees `in_` is valid for `in_len` bytes.
+    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    // Bounded by the length the peer declared, so a hostile payload cannot make us
+    // allocate without limit before the length check below runs.
+    match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+        input,
+        uncompressed_len,
+    ) {
+        Ok(v) => emit_decompressed(out, uncompressed_len, &v),
+        Err(_) => 0,
+    }
+}
+
+/// RFC 8879 algorithm 2, brotli, decompression.
+extern "C" fn cert_decompress_brotli(
+    _ssl: *mut SSL, out: *mut *mut CRYPTO_BUFFER, uncompressed_len: usize,
+    in_: *const u8, in_len: usize,
+) -> c_int {
+    // SAFETY: as above.
+    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    // Capacity is the declared length, not a guess, for the same reason.
+    let mut output = Vec::with_capacity(uncompressed_len);
+    let mut reader = input;
+    if brotli::BrotliDecompress(&mut reader, &mut output).is_err() {
+        return 0;
+    }
+    emit_decompressed(out, uncompressed_len, &output)
+}
+
+/// RFC 8879 algorithm 3, zstd, decompression.
+#[cfg(feature = "cert-compression-zstd")]
+extern "C" fn cert_decompress_zstd(
+    _ssl: *mut SSL, out: *mut *mut CRYPTO_BUFFER, uncompressed_len: usize,
+    in_: *const u8, in_len: usize,
+) -> c_int {
+    // SAFETY: as above.
+    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    match zstd::bulk::decompress(input, uncompressed_len) {
+        Ok(v) => emit_decompressed(out, uncompressed_len, &v),
+        Err(_) => 0,
+    }
+}
+
 extern "C" fn set_read_secret(
     ssl: *mut SSL, level: crypto::Level, cipher: *const SSL_CIPHER,
     secret: *const u8, secret_len: usize,
@@ -1261,6 +1350,12 @@ extern "C" {
 
     // The one CBB call a compressor needs: append the compressed bytes.
     fn CBB_add_bytes(cbb: *mut CBB, data: *const u8, len: usize) -> c_int;
+
+    // A decompressor hands its result back as a CRYPTO_BUFFER. Ownership transfers
+    // to BoringSSL, which frees it.
+    fn CRYPTO_BUFFER_new(
+        data: *const u8, len: usize, pool: *mut CRYPTO_BUFFER_POOL,
+    ) -> *mut CRYPTO_BUFFER;
     fn SSL_CTX_free(ctx: *mut SSL_CTX);
 
     fn SSL_CTX_use_certificate_chain_file(
