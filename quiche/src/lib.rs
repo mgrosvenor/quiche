@@ -8527,6 +8527,25 @@ impl<F: BufFactory> Connection<F> {
             },
 
             frame::Frame::Crypto { data } => {
+                // https://www.rfc-editor.org/rfc/rfc9001#section-8.3
+                // CRYPTO frames MUST NOT be sent in 0-RTT packets, and an endpoint
+                // that receives one MUST treat it as a connection error of type
+                // PROTOCOL_VIOLATION.
+                //
+                // Before `enable_early_data()` this could not arise: 0-RTT packets
+                // were discarded outright, so h3spec's test for it passed for free.
+                // Once early data is accepted the packets reach here and nothing
+                // checked the packet type, which cost exactly one conformance test
+                // (47/49 -> 46/49) and was the only thing standing between m6 and
+                // using 0-RTT at all.
+                //
+                // `Error::InvalidPacket` is deliberate: `Error::to_wire` maps every
+                // unlisted variant to `WireErrorCode::ProtocolViolation`, which is
+                // the code this rule requires.
+                if hdr.ty == Type::ZeroRTT {
+                    return Err(Error::InvalidPacket);
+                }
+
                 if data.max_off() >= MAX_CRYPTO_STREAM_OFFSET {
                     return Err(Error::CryptoBufferExceeded);
                 }
