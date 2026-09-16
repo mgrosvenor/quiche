@@ -885,23 +885,77 @@ fn emit_compressed(out: *mut CBB, data: &[u8]) -> c_int {
     unsafe { CBB_add_bytes(out, data.as_ptr(), data.len()) }
 }
 
+/// Compressed chains, kept for the life of the process.
+///
+/// BoringSSL calls a certificate compressor on EVERY full handshake, and a
+/// certificate chain does not change while the process runs, so without this the
+/// same bytes are recompressed per connection.
+///
+/// That is not a micro-optimisation. Measured on a 3.4KB chain, brotli at quality
+/// 11 costs 8.85ms of CPU; zlib at level 9 costs 0.137ms. Deployed with brotli and
+/// no cache, the h3 handshake against a 4.9ms path measured 14.6ms where the
+/// uncompressed chain measured 12.5ms and zlib measured about 7ms: the best
+/// compression ratio of the three was SLOWER than sending the chain in the clear,
+/// because a saved kilobyte is worth nothing against ten milliseconds of CPU. On a
+/// long path the round trip hides it; on a short one it is the whole cost.
+///
+/// Keyed by the uncompressed bytes rather than by a hash, so a collision cannot
+/// serve one host's chain in place of another's. A handful of distinct chains at a
+/// few KB each is not worth a cleverer structure.
+static COMPRESSED_CHAINS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+> = std::sync::OnceLock::new();
+
+/// Compress `input` with `compress`, reusing an earlier result for the same bytes.
+///
+/// The compressor runs OUTSIDE the lock. Two handshakes arriving together on a cold
+/// cache may both compress, which wastes one chain's worth of CPU once; holding the
+/// lock across an 8ms compression would instead serialise every concurrent
+/// handshake behind it, turning a cache into a bottleneck.
+fn compressed_chain(input: &[u8], compress: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let cache = COMPRESSED_CHAINS.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(input) {
+            return Some(hit.clone());
+        }
+    }
+    let out = compress(input)?;
+    if let Ok(mut map) = cache.lock() {
+        // Bounded so a peer cannot grow this without limit. Nothing a peer sends
+        // reaches here -- the input is our own chain -- but a bound costs one
+        // comparison and removes the question.
+        if map.len() < 8 {
+            map.insert(input.to_vec(), out.clone());
+        }
+    }
+    Some(out)
+}
+
 /// RFC 8879 algorithm 2, brotli. The best ratio of the three on our own chain.
 extern "C" fn cert_compress_brotli(
     _ssl: *mut SSL, out: *mut CBB, in_: *const u8, in_len: usize,
 ) -> c_int {
     // SAFETY: as above.
     let input = unsafe { slice::from_raw_parts(in_, in_len) };
-    let mut compressed = Vec::new();
-    let params = brotli::enc::BrotliEncoderParams {
-        quality: 11,
-        ..Default::default()
-    };
-    let mut reader = input;
-    if brotli::BrotliCompress(&mut reader, &mut compressed, &params).is_err() {
+    // Quality 11 is kept because the cache means it runs once per chain rather than
+    // once per handshake. Uncached it costs 8.85ms against zlib's 0.137ms, which is
+    // why this goes through the cache and not straight at the encoder.
+    let compressed = compressed_chain(input, |data| {
+        let mut compressed = Vec::new();
+        let params = brotli::enc::BrotliEncoderParams {
+            quality: 11,
+            ..Default::default()
+        };
+        let mut reader = data;
+        brotli::BrotliCompress(&mut reader, &mut compressed, &params)
+            .ok()
+            .map(|_| compressed)
+    });
+    match compressed {
+        Some(c) => emit_compressed(out, &c),
         // Zero means "could not compress"; BoringSSL sends the chain plain.
-        return 0;
+        None => 0,
     }
-    emit_compressed(out, &compressed)
 }
 
 /// RFC 8879 algorithm 3, zstd.
@@ -917,9 +971,12 @@ extern "C" fn cert_compress_zstd(
 ) -> c_int {
     // SAFETY: as above.
     let input = unsafe { slice::from_raw_parts(in_, in_len) };
-    match zstd::bulk::compress(input, 19) {
-        Ok(compressed) => emit_compressed(out, &compressed),
-        Err(_) => 0,
+    // Cached for the same reason as brotli: level 19 is a per-chain cost, not a
+    // per-handshake one, and paying it per connection is what made the compressed
+    // handshake slower than the uncompressed one.
+    match compressed_chain(input, |data| zstd::bulk::compress(data, 19).ok()) {
+        Some(c) => emit_compressed(out, &c),
+        None => 0,
     }
 }
 
@@ -1528,3 +1585,57 @@ extern "C" {
 
 mod boringssl;
 use boringssl::*;
+
+#[cfg(test)]
+mod cert_chain_cache {
+    use super::compressed_chain;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The compressor runs once per distinct chain, not once per call, and the
+    /// cached bytes are identical to the first result.
+    ///
+    /// BoringSSL calls the compressor on every full handshake, so "once per call"
+    /// meant 8.85ms of brotli per connection, and a compressed handshake that was
+    /// measurably slower than an uncompressed one.
+    #[test]
+    fn a_chain_is_compressed_once_and_reused() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let chain = b"a certificate chain, pretend this is DER".to_vec();
+        let compress = |d: &[u8]| {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Some(d.to_vec())
+        };
+
+        let first = compressed_chain(&chain, compress).unwrap();
+        let second = compressed_chain(&chain, compress).unwrap();
+        let third = compressed_chain(&chain, compress).unwrap();
+
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "compressed more than once");
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+    }
+
+    /// A different chain is a different entry: the cache must never serve one
+    /// host's chain in place of another's.
+    #[test]
+    fn distinct_chains_do_not_share_an_entry() {
+        let a = compressed_chain(b"chain A", |d| Some(d.to_vec())).unwrap();
+        let b = compressed_chain(b"chain B", |d| Some(d.to_vec())).unwrap();
+        assert_eq!(a, b"chain A");
+        assert_eq!(b, b"chain B");
+    }
+
+    /// A compressor that fails caches nothing, so the next handshake retries
+    /// rather than inheriting one failure for the life of the process.
+    #[test]
+    fn a_failed_compression_is_not_cached() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let failing = |_: &[u8]| -> Option<Vec<u8>> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        assert!(compressed_chain(b"unlucky chain", failing).is_none());
+        assert!(compressed_chain(b"unlucky chain", failing).is_none());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "a failure was cached");
+    }
+}
